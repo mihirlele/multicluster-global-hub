@@ -97,10 +97,11 @@ var _ = Describe("Hub HA Sync", Label("e2e-test-hubha"), Ordered, func() {
 			return getAgentHubRole(ctx, activeHubClient, "multicluster-global-hub-agent")
 		}, 2*time.Minute, 5*time.Second).Should(Equal(constants.GHHubRoleActive))
 
-		By("Waiting for active hub agent to receive standby hub configuration")
+		By("Waiting for active hub agent to receive prefixed standby hub configuration")
 		Eventually(func() string {
 			return getStandByHub(ctx, activeHubClient, "multicluster-global-hub-agent")
-		}, 2*time.Minute, 5*time.Second).Should(Equal("local-cluster"))
+		}, 2*time.Minute, 5*time.Second).Should(Equal("global-hub/local-cluster"),
+			"active hub agent must receive the prefixed standbyHub value for global-hub local standby routing")
 
 		By("Waiting for local agent on global hub to receive role configuration")
 		Eventually(func() string {
@@ -1065,6 +1066,9 @@ var _ = Describe("Hub HA Sync", Label("e2e-test-hubha"), Ordered, func() {
 					return activeHubClient.Update(ctx, activeCluster)
 				}, 1*time.Minute, 5*time.Second).Should(Succeed())
 
+				By("Waiting for ManagedCluster resourceVersion to stabilize after update")
+				waitForManagedClusterStable(ctx, activeHubClient, testClusterName, 10*time.Second)
+
 				By("Verifying update is synced with hubAcceptsClient still false")
 				Eventually(func() error {
 					standbyCluster := &clusterv1.ManagedCluster{}
@@ -1089,7 +1093,7 @@ var _ = Describe("Hub HA Sync", Label("e2e-test-hubha"), Ordered, func() {
 
 					klog.Infof("ManagedCluster %s update synced correctly with hubAcceptsClient=false maintained", testClusterName)
 					return nil
-				}, hubHASyncWait+30*time.Second, 5*time.Second).Should(Succeed())
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
 			})
 		})
 	})

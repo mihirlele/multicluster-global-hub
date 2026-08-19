@@ -1,4 +1,5 @@
-// Copyright Contributors to the Open Cluster Management project.
+// Copyright (c) 2026 Red Hat, Inc.
+// Copyright Contributors to the Open Cluster Management project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -146,6 +147,9 @@ func TestHubHAResourceSourceAllowed(t *testing.T) {
 	if !hubHAResourceSourceAllowed(ctx, fakeClient, standby, "hub1", "hub2") {
 		t.Fatal("expected peer active hub source to be allowed")
 	}
+	if !hubHAResourceSourceAllowed(ctx, fakeClient, standby, "hub1", "global-hub/hub2") {
+		t.Fatal("expected prefixed global-hub HA resource subject to be allowed")
+	}
 	if hubHAResourceSourceAllowed(ctx, fakeClient, standby, "spoofed-hub", "hub2") {
 		t.Fatal("expected unexpected leaf hub source to be rejected")
 	}
@@ -221,6 +225,16 @@ func TestSpecEventSourceAllowed_GlobalHubSourceBypassesTypeChecks(t *testing.T) 
 	}
 }
 
+func TestSpecEventSourceAllowedRejectsUnknownNonMigrationType(t *testing.T) {
+	ctx := context.Background()
+	agentConfig := &configs.AgentConfig{LeafHubName: "hub2"}
+
+	unknownType := utils.ToCloudEvent("UnknownType", "hub1", "hub2", nil)
+	if specEventSourceAllowed(ctx, nil, agentConfig, &unknownType, "hub2") {
+		t.Fatal("expected unknown non-migration event type to be rejected")
+	}
+}
+
 func TestHaConfigSourceAllowed(t *testing.T) {
 	cfg := &configs.AgentConfig{LeafHubName: "hub2"}
 	cfg.SetStandbyHub("hub1")
@@ -230,6 +244,11 @@ func TestHaConfigSourceAllowed(t *testing.T) {
 	}
 	if !haConfigSourceAllowed(cfg, "hub1", "hub2") {
 		t.Fatal("expected configured standby hub source to be allowed")
+	}
+	cfgPrefixed := &configs.AgentConfig{LeafHubName: "hub2"}
+	cfgPrefixed.SetStandbyHub("global-hub/hub1")
+	if !haConfigSourceAllowed(cfgPrefixed, "hub1", "hub2") {
+		t.Fatal("expected unprefixed source to match prefixed configured standby hub")
 	}
 	if haConfigSourceAllowed(cfg, "hub3", "hub2") {
 		t.Fatal("expected unexpected standby hub source to be rejected")
@@ -242,7 +261,7 @@ func TestHaConfigSourceAllowed(t *testing.T) {
 	}
 
 	cfgWithoutPeer := &configs.AgentConfig{LeafHubName: "hub2"}
-	if !haConfigSourceAllowed(cfgWithoutPeer, "any-peer", "hub2") {
-		t.Fatal("expected peer source to be allowed when standby hub is not configured")
+	if !haConfigSourceAllowed(cfgWithoutPeer, "local-cluster", "hub2") {
+		t.Fatal("expected bootstrap HA config source to be allowed when standby hub is not configured")
 	}
 }

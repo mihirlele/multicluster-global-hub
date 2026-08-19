@@ -18,7 +18,12 @@ import (
 	migrationbundle "github.com/stolostron/multicluster-global-hub/pkg/bundle/migration"
 	"github.com/stolostron/multicluster-global-hub/pkg/constants"
 	"github.com/stolostron/multicluster-global-hub/pkg/enum"
+	"github.com/stolostron/multicluster-global-hub/pkg/logger"
 )
+
+var migrationValidationLog = logger.DefaultZapLogger()
+
+const metal3Group = "metal3.io"
 
 type localMigrationRecord struct {
 	fromHub string
@@ -38,6 +43,12 @@ var migrationDeployAllowedGVKs = map[schema.GroupVersionKind]struct{}{
 	{Group: "", Version: "v1", Kind: "ConfigMap"}:                                             {},
 	{Group: "", Version: "v1", Kind: "Namespace"}:                                             {},
 	{Group: "work.open-cluster-management.io", Version: "v1", Kind: "ManifestWork"}:           {},
+	{Group: "hive.openshift.io", Version: "v1", Kind: "ClusterDeployment"}:                    {},
+	{Group: "extensions.hive.openshift.io", Version: "v1alpha1", Kind: "ImageClusterInstall"}: {},
+	{Group: metal3Group, Version: "v1alpha1", Kind: "BareMetalHost"}:                          {},
+	{Group: metal3Group, Version: "v1alpha1", Kind: "HostFirmwareSettings"}:                   {},
+	{Group: metal3Group, Version: "v1alpha1", Kind: "FirmwareSchema"}:                         {},
+	{Group: metal3Group, Version: "v1alpha1", Kind: "HostFirmwareComponents"}:                 {},
 }
 
 // IsMigrationDeployingEvent reports whether evt is a migration resource deploying event.
@@ -68,6 +79,7 @@ func MigrationSourceAllowed(ctx context.Context, c client.Client, source, target
 
 	list := &migrationv1alpha1.ManagedClusterMigrationList{}
 	if err := c.List(ctx, list); err != nil {
+		migrationValidationLog.Warnw("failed to list ManagedClusterMigration for source validation", "error", err)
 		return false
 	}
 
@@ -131,7 +143,7 @@ func EnsureLocalMigrationCR(
 	return nil
 }
 
-// DeleteLocalMigrationCR removes recorded local migration state after cleaning completes.
+// DeleteLocalMigrationCR removes recorded local migration state after cleaning or rollback.
 func DeleteLocalMigrationCR(_ context.Context, _ client.Client, migrationName string) error {
 	if migrationName == "" {
 		return nil
@@ -168,6 +180,10 @@ func IsMigrationDeployResourceAllowed(resource *unstructured.Unstructured, clust
 	case "ManifestWork":
 		return resource.GetNamespace() == clusterName
 	case "Secret", "ConfigMap":
+		return resource.GetNamespace() == clusterName
+	case "ClusterDeployment", "ImageClusterInstall":
+		return resource.GetNamespace() == clusterName && resource.GetName() == clusterName
+	case "BareMetalHost", "HostFirmwareSettings", "FirmwareSchema", "HostFirmwareComponents":
 		return resource.GetNamespace() == clusterName
 	default:
 		return false
