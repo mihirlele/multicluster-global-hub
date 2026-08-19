@@ -2,6 +2,7 @@ package transporter
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -52,6 +53,7 @@ var (
 type TransportReconciler struct {
 	ctrl.Manager
 	transporter transport.Transporter
+	olmVersion  string
 }
 
 func (c *TransportReconciler) IsResourceRemoved() bool {
@@ -61,6 +63,16 @@ func (c *TransportReconciler) IsResourceRemoved() bool {
 
 func StartController(controllerOption config.ControllerOption) (config.ControllerInterface, error) {
 	if transportReconciler != nil {
+		if !migrationACLControllerStarted {
+			if err := migrationACLReconcilerSetup(controllerOption.Manager); err != nil {
+				return nil, err
+			}
+		}
+		if !hubHAACLControllerStarted {
+			if err := hubHAACLReconcilerSetup(controllerOption.Manager); err != nil {
+				return nil, fmt.Errorf("setup Hub HA ACL reconciler: %w", err)
+			}
+		}
 		return transportReconciler, nil
 	}
 	log.Info("start transport controller")
@@ -71,15 +83,30 @@ func StartController(controllerOption config.ControllerOption) (config.Controlle
 		kafkaNetworkPolicyWatchNamespace = controllerOption.OperatorConfig.PodNamespace
 	}
 
-	transportReconciler = NewTransportReconciler(controllerOption.Manager)
+	olmVersion := ""
+	if controllerOption.OperatorConfig != nil {
+		olmVersion = controllerOption.OperatorConfig.OLMVersion
+	}
+	transportReconciler = NewTransportReconciler(controllerOption.Manager, olmVersion)
 	err := transportReconciler.SetupWithManager(controllerOption.Manager)
 	if err != nil {
 		transportReconciler = nil
 		return nil, err
 	}
+	if err := migrationACLReconcilerSetup(controllerOption.Manager); err != nil {
+		return nil, err
+	}
+	if err := hubHAACLReconcilerSetup(controllerOption.Manager); err != nil {
+		return nil, fmt.Errorf("setup Hub HA ACL reconciler: %w", err)
+	}
 	log.Infof("inited transport controller")
 	return transportReconciler, nil
 }
+
+var (
+	migrationACLReconcilerSetup = setupMigrationACLReconciler
+	hubHAACLReconcilerSetup     = setupHubHAACLReconciler
+)
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *TransportReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -136,8 +163,8 @@ func secretCond(obj client.Object) bool {
 	return false
 }
 
-func NewTransportReconciler(mgr ctrl.Manager) *TransportReconciler {
-	return &TransportReconciler{Manager: mgr}
+func NewTransportReconciler(mgr ctrl.Manager, olmVersion string) *TransportReconciler {
+	return &TransportReconciler{Manager: mgr, olmVersion: olmVersion}
 }
 
 // Resources reconcile the transport resources and also update transporter on the configuration
@@ -188,6 +215,7 @@ func (r *TransportReconciler) reconcileStrimziKafka(ctx context.Context, mgh *v1
 		mgh,
 		protocol.WithContext(ctx),
 		protocol.WithCommunity(operatorutils.IsCommunityMode()),
+		protocol.WithOLMVersion(r.olmVersion),
 	)
 	r.transporter = strimziTransporter
 
@@ -199,10 +227,12 @@ func (r *TransportReconciler) reconcileStrimziKafka(ctx context.Context, mgh *v1
 	if needRequeue {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	// deliver the transport resources and config secret to the kafka controller
-	// TODO: may need to wait the kafka resources to be ready before delivering the config secret
-	err = protocol.StartKafkaController(ctx, r.Manager, r.transporter)
+	// Start the async kafka controller; sync transport-config when Kafka is already ready.
+	err = protocol.StartKafkaController(ctx, r.Manager, strimziTransporter)
 	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := protocol.SyncManagerTransportConfigSecret(ctx, mgh, strimziTransporter, r.GetClient()); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil

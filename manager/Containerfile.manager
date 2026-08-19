@@ -18,18 +18,20 @@ COPY ./pkg/ ./pkg/
 RUN PKG_CONFIG_PATH=/usr/local/lib/pkgconfig CGO_ENABLED=1 GOFLAGS="-p=4" go build -mod=readonly -tags dynamic,strictfipsruntime -a -v -o bin/manager ./manager/cmd/main.go
 
 # Stage 2: Copy the binaries from the image builder to the base image
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest
 
 # Red Hat annotations.
 LABEL com.redhat.component="multicluster-globalhub-manager-rhel9"
 LABEL org.label-schema.vendor="Red Hat"
 LABEL org.label-schema.license="Red Hat Advanced Cluster Management for Kubernetes EULA"
 LABEL org.label-schema.schema-version="1.0"
-LABEL cpe="cpe:/a:redhat:multicluster_globalhub:5.0::el9"
+ARG RELEASE_CPE="cpe:/a:redhat:multicluster_globalhub:5.0::el9"
+ARG RELEASE_VERSION="release-5.0"
+LABEL cpe="${RELEASE_CPE}"
 
 # Bundle metadata
 LABEL name="multicluster-globalhub/multicluster-globalhub-manager-rhel9"
-LABEL version="release-5.0"
+LABEL version="${RELEASE_VERSION}"
 LABEL summary="multicluster global hub manager"
 LABEL io.openshift.expose-services=""
 LABEL io.openshift.tags="data,images"

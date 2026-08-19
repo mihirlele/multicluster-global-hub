@@ -105,6 +105,19 @@ func TestDispatch_DropsMissingSubject(t *testing.T) {
 	assert.Equal(t, 0, recorder.called)
 }
 
+func TestDispatch_AllowsPrefixedGlobalHubStandbySubject(t *testing.T) {
+	recorder := runDispatchScenario(t, dispatchScenario{
+		events: []*cloudevents.Event{
+			func() *cloudevents.Event {
+				evt := utils.ToCloudEvent("Policy", constants.CloudEventGlobalHubClusterName, "global-hub/hub2", nil)
+				return &evt
+			}(),
+		},
+	})
+	assert.Equal(t, 1, recorder.called,
+		"prefixed global-hub standby subjects must be delivered to the syncer")
+}
+
 func TestDispatch_DropsSubjectMismatch(t *testing.T) {
 	recorder := runDispatchScenario(t, dispatchScenario{
 		events: []*cloudevents.Event{
@@ -150,9 +163,10 @@ func TestDispatch_UsesTypeSpecificSyncer(t *testing.T) {
 	agentConfig := &configs.AgentConfig{LeafHubName: "hub2"}
 
 	dispatcher := &genericDispatcher{
-		log:         logger.DefaultZapLogger(),
-		consumer:    &mockConsumer{eventChan: eventChan},
-		agentConfig: agentConfig,
+		log:           logger.DefaultZapLogger(),
+		consumer:      &mockConsumer{eventChan: eventChan},
+		agentConfig:   agentConfig,
+		validationSem: make(chan struct{}, maxConcurrentSpecValidations),
 		syncers: map[string]Syncer{
 			constants.GenericSpecMsgKey: genericRecorder,
 			"Policy":                    typedRecorder,
@@ -182,9 +196,10 @@ func runDispatchScenario(t *testing.T, scenario dispatchScenario) *recordingSync
 	agentConfig := &configs.AgentConfig{LeafHubName: "hub2"}
 
 	dispatcher := &genericDispatcher{
-		log:         logger.DefaultZapLogger(),
-		consumer:    &mockConsumer{eventChan: eventChan},
-		agentConfig: agentConfig,
+		log:           logger.DefaultZapLogger(),
+		consumer:      &mockConsumer{eventChan: eventChan},
+		agentConfig:   agentConfig,
+		validationSem: make(chan struct{}, maxConcurrentSpecValidations),
 		syncers: map[string]Syncer{
 			constants.GenericSpecMsgKey: recorder,
 		},
@@ -211,7 +226,7 @@ func countTrustedEvents(events []*cloudevents.Event) int {
 			continue
 		}
 		subject := evt.Subject()
-		if subject == "" || (subject != transport.Broadcast && subject != "hub2") {
+		if subject == "" || (subject != transport.Broadcast && !utils.MatchesGlobalHubStandbySubject(subject, "hub2")) {
 			continue
 		}
 		if expired, _ := isEventExpired(evt); expired {
@@ -249,10 +264,11 @@ func TestDispatch_AllowsRegisteredMigrationDeploying(t *testing.T) {
 	agentConfig := &configs.AgentConfig{LeafHubName: "hub2"}
 
 	dispatcher := &genericDispatcher{
-		log:         logger.DefaultZapLogger(),
-		client:      fakeClient,
-		consumer:    &mockConsumer{eventChan: eventChan},
-		agentConfig: agentConfig,
+		log:           logger.DefaultZapLogger(),
+		client:        fakeClient,
+		consumer:      &mockConsumer{eventChan: eventChan},
+		agentConfig:   agentConfig,
+		validationSem: make(chan struct{}, maxConcurrentSpecValidations),
 		syncers: map[string]Syncer{
 			string(enum.ManagedClusterMigrationType): recorder,
 		},
@@ -281,9 +297,10 @@ func TestDispatch_SourceValidation(t *testing.T) {
 	agentConfig := &configs.AgentConfig{LeafHubName: "hub2"}
 
 	dispatcher := &genericDispatcher{
-		log:         logger.DefaultZapLogger(),
-		consumer:    &mockConsumer{eventChan: eventChan},
-		agentConfig: agentConfig,
+		log:           logger.DefaultZapLogger(),
+		consumer:      &mockConsumer{eventChan: eventChan},
+		agentConfig:   agentConfig,
+		validationSem: make(chan struct{}, maxConcurrentSpecValidations),
 		syncers: map[string]Syncer{
 			constants.GenericSpecMsgKey: recorder,
 		},

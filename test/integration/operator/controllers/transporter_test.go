@@ -92,7 +92,7 @@ var _ = Describe("transporter", Ordered, func() {
 		Expect(config.GetSpecTopic()).To(Equal("gh-spec"))
 		Expect(config.GetRawStatusTopic()).To(Equal("gh-status"))
 
-		reconciler := operatortrans.NewTransportReconciler(runtimeManager)
+		reconciler := operatortrans.NewTransportReconciler(runtimeManager, config.OLMVersionV0)
 
 		Eventually(func() error {
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{
@@ -147,7 +147,7 @@ var _ = Describe("transporter", Ordered, func() {
 		Expect(config.GetSpecTopic()).To(Equal("gh-spec"))
 		Expect(config.GetRawStatusTopic()).To(Equal("gh-status.*"))
 
-		reconciler := operatortrans.NewTransportReconciler(runtimeManager)
+		reconciler := operatortrans.NewTransportReconciler(runtimeManager, config.OLMVersionV0)
 
 		// blocking until get the connection
 		go func() {
@@ -215,7 +215,7 @@ var _ = Describe("transporter", Ordered, func() {
 		}, 10*time.Second, 100*time.Millisecond).ShouldNot(HaveOccurred())
 
 		// update the kafka resource to make it ready
-		err = UpdateKafkaClusterReady(runtimeClient, mgh.Namespace)
+		err = UpdateKafkaClusterReady(ctx, runtimeClient, mgh.Namespace)
 		Expect(err).To(Succeed())
 
 		// verify the metrics resources and pod monitor
@@ -266,6 +266,7 @@ var _ = Describe("transporter", Ordered, func() {
 			runtimeManager,
 			mgh,
 			protocol.WithCommunity(false),
+			protocol.WithOLMVersion(config.OLMVersionV0),
 			protocol.WithNamespacedName(types.NamespacedName{
 				Name:      protocol.KafkaClusterName,
 				Namespace: mgh.Namespace,
@@ -427,14 +428,13 @@ var _ = Describe("transporter", Ordered, func() {
 
 		err = runtimeClient.Get(ctx, client.ObjectKeyFromObject(kafkaUser), kafkaUser)
 		Expect(err).To(Succeed())
-		// utils.PrettyPrint(kafkaUser.Spec.Authorization)
-		Expect(3).To(Equal(len(kafkaUser.Spec.Authorization.Acls)))
 
 		// topic: create
 		clusterTopic, err := trans.EnsureTopic(clusterName)
 		Expect(err).To(Succeed())
 		Expect("gh-spec").To(Equal(clusterTopic.SpecTopic))
 		Expect(config.GetStatusTopic(clusterName)).To(Equal(clusterTopic.StatusTopic))
+		Expect(config.GetMigrationTopic()).To(Equal(clusterTopic.MigrationTopic))
 
 		// topic: update
 		_, err = trans.EnsureTopic(clusterName)
@@ -444,6 +444,65 @@ var _ = Describe("transporter", Ordered, func() {
 
 		err = trans.Prune(clusterName)
 		Expect(err).To(Succeed())
+	})
+
+	It("should reconcile managed-hub KafkaUser ACLs", func() {
+		const (
+			clusterName         = "hub1"
+			consumerGroupPrefix = "testprefix-"
+		)
+
+		Eventually(func() error {
+			if err := runtimeClient.Get(ctx, client.ObjectKeyFromObject(mgh), mgh); err != nil {
+				return err
+			}
+			mgh.Spec.DataLayerSpec.Kafka.ConsumerGroupPrefix = consumerGroupPrefix
+			return runtimeClient.Update(ctx, mgh)
+		}, 10*time.Second, 100*time.Millisecond).Should(Succeed(),
+			"update MulticlusterGlobalHub with the consumer-group prefix")
+
+		err := config.SetMulticlusterGlobalHubConfig(ctx, mgh, nil, nil)
+		Expect(err).To(Succeed(), "set managed-hub configuration with the consumer-group prefix")
+		err = config.SetTransportConfig(ctx, runtimeClient, mgh)
+		Expect(err).To(Succeed(), "set transporter configuration")
+
+		trans := protocol.NewStrimziTransporter(
+			runtimeManager,
+			mgh,
+			protocol.WithCommunity(false),
+			protocol.WithOLMVersion(config.OLMVersionV0),
+			protocol.WithNamespacedName(types.NamespacedName{
+				Name:      protocol.KafkaClusterName,
+				Namespace: mgh.Namespace,
+			}),
+		)
+
+		Eventually(func() error {
+			needRequeue, err := trans.EnsureKafka()
+			if err != nil {
+				return err
+			}
+			if needRequeue {
+				return fmt.Errorf("EnsureKafka requires requeue")
+			}
+			return nil
+		}, 30*time.Second, 1*time.Second).Should(Succeed(), "ensure Kafka cluster is ready for managed-hub ACL reconciliation")
+
+		userName, err := trans.EnsureUser(clusterName)
+		Expect(err).To(Succeed(), "ensure the managed-hub KafkaUser")
+		Expect(config.GetKafkaUserName(clusterName)).To(Equal(userName),
+			"EnsureUser should return the configured KafkaUser name")
+
+		kafkaUser := &kafkav1beta2.KafkaUser{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      userName,
+				Namespace: mgh.Namespace,
+			},
+		}
+		err = runtimeClient.Get(ctx, client.ObjectKeyFromObject(kafkaUser), kafkaUser)
+		Expect(err).To(Succeed(), "get the reconciled managed-hub KafkaUser")
+
+		expectManagedHubKafkaUserACLs(kafkaUser, clusterName, consumerGroupPrefix)
 	})
 
 	AfterAll(func() {
@@ -456,12 +515,76 @@ var _ = Describe("transporter", Ordered, func() {
 	})
 })
 
-func UpdateKafkaClusterReady(c client.Client, ns string) error {
+func expectManagedHubKafkaUserACLs(
+	kafkaUser *kafkav1beta2.KafkaUser,
+	clusterName string,
+	consumerGroupPrefix string,
+) {
+	Expect(len(kafkaUser.Spec.Authorization.Acls)).To(Equal(4), "managed hub KafkaUser should have four ACL entries")
+
+	aclByTopic := map[string][]kafkav1beta2.KafkaUserSpecAuthorizationAclsElemOperationsElem{}
+	consumerGroupACLs := []kafkav1beta2.KafkaUserSpecAuthorizationAclsElem{}
+	for _, acl := range kafkaUser.Spec.Authorization.Acls {
+		switch acl.Resource.Type {
+		case kafkav1beta2.KafkaUserSpecAuthorizationAclsElemResourceTypeTopic:
+			Expect(acl.Resource.Name).NotTo(BeNil(), "topic ACL must name its resource")
+			Expect(acl.Resource.PatternType).NotTo(BeNil(), "topic ACL must use a pattern type")
+			Expect(*acl.Resource.PatternType).To(
+				Equal(kafkav1beta2.KafkaUserSpecAuthorizationAclsElemResourcePatternTypeLiteral),
+				"topic ACL must use literal pattern matching",
+			)
+			aclByTopic[*acl.Resource.Name] = acl.Operations
+		case kafkav1beta2.KafkaUserSpecAuthorizationAclsElemResourceTypeGroup:
+			consumerGroupACLs = append(consumerGroupACLs, acl)
+		}
+	}
+
+	specOps := aclByTopic["gh-spec"]
+	Expect(specOps).To(ConsistOf(
+		kafkav1beta2.KafkaUserSpecAuthorizationAclsElemOperationsElemDescribe,
+		kafkav1beta2.KafkaUserSpecAuthorizationAclsElemOperationsElemRead,
+	), "gh-spec ACL should grant Describe and Read only")
+	Expect(specOps).NotTo(ContainElement(kafkav1beta2.KafkaUserSpecAuthorizationAclsElemOperationsElemWrite),
+		"gh-spec ACL must not grant Write to managed hubs")
+
+	migrationOps := aclByTopic[config.GetMigrationTopic()]
+	Expect(migrationOps).To(ConsistOf(
+		kafkav1beta2.KafkaUserSpecAuthorizationAclsElemOperationsElemDescribe,
+		kafkav1beta2.KafkaUserSpecAuthorizationAclsElemOperationsElemRead,
+	), "gh-migration ACL should grant Describe and Read for managed hub consumers")
+
+	statusOps := aclByTopic[config.GetStatusTopic(clusterName)]
+	Expect(statusOps).To(Equal([]kafkav1beta2.KafkaUserSpecAuthorizationAclsElemOperationsElem{
+		kafkav1beta2.KafkaUserSpecAuthorizationAclsElemOperationsElemWrite,
+	}), "status topic ACL should grant Write only to the hub status topic")
+
+	Expect(consumerGroupACLs).To(HaveLen(1), "managed hub should have one consumer-group ACL")
+	Expect(consumerGroupACLs[0].Resource.Type).To(
+		Equal(kafkav1beta2.KafkaUserSpecAuthorizationAclsElemResourceTypeGroup),
+		"consumer-group ACL must target a group resource",
+	)
+	Expect(consumerGroupACLs[0].Resource.Name).NotTo(BeNil(), "consumer-group ACL must name its group")
+	Expect(consumerGroupACLs[0].Resource.PatternType).NotTo(BeNil(), "consumer-group ACL must use a pattern type")
+	Expect(*consumerGroupACLs[0].Resource.PatternType).To(
+		Equal(kafkav1beta2.KafkaUserSpecAuthorizationAclsElemResourcePatternTypeLiteral),
+		"consumer-group ACL must use literal pattern matching",
+	)
+	expectedGroupID := config.GetConsumerGroupID(consumerGroupPrefix, clusterName)
+	Expect(*consumerGroupACLs[0].Resource.Name).To(Equal(expectedGroupID),
+		"consumer-group ACL must include the configured consumer group prefix")
+	Expect(*consumerGroupACLs[0].Resource.Name).NotTo(Equal("*"),
+		"consumer-group ACL must not use wildcard group authorization")
+	Expect(consumerGroupACLs[0].Operations).To(ConsistOf(
+		kafkav1beta2.KafkaUserSpecAuthorizationAclsElemOperationsElemRead,
+	), "consumer-group ACL should grant Read only")
+}
+
+func UpdateKafkaClusterReady(ctx context.Context, c client.Client, ns string) error {
 	kafkaVersion := "4.1.0"
 	kafkaClusterName := "kafka"
 	globalHubKafkaUser := "global-hub-kafka-user"
-	clientCa := "kafka-clients-ca-cert"
-	clientCaCert := "kafka-clients-ca"
+	clientCAKeySecret := "kafka-clients-ca"
+	clientCACertSecret := "kafka-clients-ca-cert"
 
 	readyCondition := "Ready"
 	trueCondition := "True"
@@ -507,15 +630,15 @@ func UpdateKafkaClusterReady(c client.Client, ns string) error {
 		},
 	}
 
-	if err := wait.PollUntilContextTimeout(context.Background(), 1*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 1*time.Minute, true, func(pollCtx context.Context) (bool, error) {
 		existkafkaCluster := &kafkav1beta2.Kafka{}
-		err := c.Get(context.Background(), types.NamespacedName{
+		err := c.Get(pollCtx, types.NamespacedName{
 			Name:      kafkaClusterName,
 			Namespace: ns,
 		}, existkafkaCluster)
 		if err != nil {
 			if errors.IsNotFound(err) {
-				if e := c.Create(context.Background(), statusKafkaCluster); e != nil {
+				if e := c.Create(pollCtx, statusKafkaCluster); e != nil {
 					klog.Errorf("Failed to create kafka cluster, error: %v", e)
 					return false, nil
 				}
@@ -540,7 +663,7 @@ func UpdateKafkaClusterReady(c client.Client, ns string) error {
 				},
 			},
 		}
-		err = c.Status().Update(context.Background(), existkafkaCluster)
+		err = c.Status().Update(pollCtx, existkafkaCluster)
 		if err != nil {
 			klog.Errorf("Failed to update Kafka cluster, error:%v", err)
 			return false, nil
@@ -550,7 +673,7 @@ func UpdateKafkaClusterReady(c client.Client, ns string) error {
 		return err
 	}
 
-	err := createSecret(c, ns, globalHubKafkaUser, map[string][]byte{
+	err := createSecret(ctx, c, ns, globalHubKafkaUser, map[string][]byte{
 		"user.crt": []byte("usercrt"),
 		"user.key": []byte("userkey"),
 	})
@@ -558,14 +681,14 @@ func UpdateKafkaClusterReady(c client.Client, ns string) error {
 		return err
 	}
 
-	err = createSecret(c, ns, clientCa, map[string][]byte{
+	err = createSecret(ctx, c, ns, clientCAKeySecret, map[string][]byte{
 		"ca.key": []byte("cakey"),
 	})
 	if err != nil {
 		return err
 	}
 
-	err = createSecret(c, ns, clientCaCert, map[string][]byte{
+	err = createSecret(ctx, c, ns, clientCACertSecret, map[string][]byte{
 		"ca.crt": []byte("cacert"),
 	})
 	if err != nil {
@@ -574,22 +697,27 @@ func UpdateKafkaClusterReady(c client.Client, ns string) error {
 	return nil
 }
 
-func createSecret(c client.Client, ns, name string, data map[string][]byte) error {
-	clientCaCertSecret := &corev1.Secret{
+func createSecret(ctx context.Context, c client.Client, ns, name string, data map[string][]byte) error {
+	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ns,
 			Name:      name,
 		},
-		Data: data,
 	}
-	err := c.Get(context.Background(), client.ObjectKeyFromObject(clientCaCertSecret), clientCaCertSecret)
+	err := c.Get(ctx, client.ObjectKeyFromObject(secret), secret)
 	if errors.IsNotFound(err) {
-		e := c.Create(context.Background(), clientCaCertSecret)
-		if e != nil {
-			return e
+		secret.Data = data
+		if err := c.Create(ctx, secret); err != nil {
+			return fmt.Errorf("create secret %s/%s: %w", ns, name, err)
 		}
-	} else if err != nil {
-		return err
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get secret %s/%s: %w", ns, name, err)
+	}
+	secret.Data = data
+	if err := c.Update(ctx, secret); err != nil {
+		return fmt.Errorf("update secret %s/%s: %w", ns, name, err)
 	}
 	return nil
 }
