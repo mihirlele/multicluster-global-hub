@@ -1,0 +1,89 @@
+---
+# ImageDigestMirrorSet for konflux to registry.redhat.io mirroring
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: global-hub-mirror-set
+spec:
+  imageDigestMirrors:
+    - mirrors:
+        - quay.io/redhat-user-workloads/acm-multicluster-glo-tenant/multicluster-global-hub-agent-globalhub-1-7
+      source: registry.redhat.io/multicluster-globalhub/multicluster-globalhub-agent-rhel9
+    - mirrors:
+        - quay.io/redhat-user-workloads/acm-multicluster-glo-tenant/multicluster-global-hub-manager-globalhub-1-7
+      source: registry.redhat.io/multicluster-globalhub/multicluster-globalhub-manager-rhel9
+    - mirrors:
+        - quay.io/redhat-user-workloads/acm-multicluster-glo-tenant/multicluster-global-hub-operator-globalhub-1-7
+      source: registry.redhat.io/multicluster-globalhub/multicluster-globalhub-rhel9-operator
+    - mirrors:
+        - quay.io/redhat-user-workloads/acm-multicluster-glo-tenant/glo-grafana-globalhub-1-7
+      source: registry.redhat.io/multicluster-globalhub/multicluster-globalhub-grafana-rhel9
+    - mirrors:
+        - quay.io/redhat-user-workloads/acm-multicluster-glo-tenant/postgres-exporter-globalhub-1-7
+      source: registry.redhat.io/multicluster-globalhub/multicluster-globalhub-postgres-exporter-rhel9
+    - mirrors:
+        - quay.io/redhat-user-workloads/acm-multicluster-glo-tenant/multicluster-global-hub-operator-bundle-globalhub-1-7
+      source: registry.redhat.io/multicluster-globalhub/multicluster-globalhub-operator-bundle
+---
+# ClusterCatalog using konflux-built catalog with digest
+apiVersion: olm.operatorframework.io/v1
+kind: ClusterCatalog
+metadata:
+  name: global-hub
+  labels:
+    olm.operatorframework.io/metadata.name: global-hub
+spec:
+  source:
+    type: Image
+    image:
+      ref: quay.io/redhat-user-workloads/acm-multicluster-glo-tenant/multicluster-global-hub-operator-catalog-v421-globalhub-1-7@sha256:5e40c29cb091e9e4d1b8cccb1d2775b06e845281f9d8294c7dd92e12034526bd
+---
+# Namespace for operator installation
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: multicluster-global-hub
+---
+# ServiceAccount for OLMv1 installer (follows Red Hat naming convention)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: multicluster-global-hub-operator-rh-installer
+  namespace: multicluster-global-hub
+---
+# ClusterRoleBinding granting cluster-admin to installer SA
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: multicluster-global-hub-operator-rh-installer-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: multicluster-global-hub-operator-rh-installer
+  namespace: multicluster-global-hub
+---
+# ClusterExtension for OLMv1 operator installation (OwnNamespace mode)
+# NOTE: watchNamespace requires TechPreviewNoUpgrade feature set with SingleOwnNamespaceInstallSupport
+# For OCP 4.18-4.20 or clusters without this feature, remove the config section for AllNamespaces mode
+apiVersion: olm.operatorframework.io/v1
+kind: ClusterExtension
+metadata:
+  name: multicluster-global-hub-operator-rh
+spec:
+  namespace: multicluster-global-hub
+  serviceAccount:
+    name: multicluster-global-hub-operator-rh-installer
+  config:
+    configType: Inline
+    inline:
+      watchNamespace: multicluster-global-hub
+  source:
+    sourceType: Catalog
+    catalog:
+      packageName: multicluster-global-hub-operator-rh
+      selector:
+        matchLabels:
+          olm.operatorframework.io/metadata.name: global-hub

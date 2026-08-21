@@ -57,3 +57,29 @@ integration-test/manager: setup_envtest
 
 integration-test/operator: setup_envtest
 	KUBEBUILDER_ASSETS="$(shell ${TMP_BIN}/setup-envtest use --use-env -p path)" ${GO_TEST} `go list ./test/integration/operator/...`
+
+##@ OLMv1 Validation
+
+.PHONY: olmv1-ocp-setup
+olmv1-ocp-setup: ## Setup Global Hub operator via OLMv1 on OCP cluster
+	@echo "Setting up OLMv1 installation on connected OCP cluster..."
+	@chmod +x ./test/script/olmv1_ocp_setup.sh
+	./test/script/olmv1_ocp_setup.sh
+
+.PHONY: olmv1-ocp-validate
+olmv1-ocp-validate: ## Validate OLMv1 installation and runtime behavior (OCPSTRAT-2268)
+	@echo "Running OLMv1 validation..."
+	@chmod +x ./test/script/olmv1_ocp_validate.sh
+	./test/script/olmv1_ocp_validate.sh
+
+.PHONY: olmv1-ocp-cleanup
+olmv1-ocp-cleanup: ## Cleanup OLMv1 installation from OCP cluster
+	@echo "Cleaning up OLMv1 resources..."
+	@chmod +x ./test/script/olmv1_ocp_cleanup.sh
+	./test/script/olmv1_ocp_cleanup.sh
+
+.PHONY: olmv1-ocp-test-all
+olmv1-ocp-test-all: olmv1-ocp-setup olmv1-ocp-validate ## Run complete OLMv1 validation workflow
+	@echo "OLMv1 validation workflow complete"
+	@echo "Next: Create Jira issue linked to OCPSTRAT-2268 with results"
+	@echo "Template: test/docs/olmv1-validation-report.md"
