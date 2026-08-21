@@ -17,14 +17,19 @@ OLMv1 is a redesigned operator lifecycle management system that GA'd in OCP 4.18
 ### Cluster Requirements
 
 - **OCP Version:** 4.18+ with OLMv1 support
-  - For OCP 4.21+: TechPreviewNoUpgrade feature set enables additional features
-  - For OCP 4.18-4.20: Basic OLMv1 is available
+  - **OCP 4.18-4.20:** Basic OLMv1 available (AllNamespaces install mode only)
+  - **OCP 4.21+ with TechPreviewNoUpgrade:** Full OLMv1 with OwnNamespace support
   
 - **Cluster Access:** cluster-admin privileges required
 
-- **Feature Gates (OCP 4.21+):**
-  - `TechPreviewNoUpgrade` feature set enables `SingleOwnNamespaceInstallSupport`
-  - Required for OwnNamespace install mode
+- **Install Modes:**
+  - **OwnNamespace** (Technology Preview on OCP 4.21+):
+    - Requires `TechPreviewNoUpgrade` feature set
+    - Requires `SingleOwnNamespaceInstallSupport` feature gate
+    - Operator watches only its installation namespace
+  - **AllNamespaces** (Available on all OCP 4.18+):
+    - Default fallback when OwnNamespace is unavailable
+    - Operator watches all namespaces cluster-wide
 
 ### Tool Requirements
 

@@ -66,6 +66,8 @@ subjects:
   namespace: multicluster-global-hub
 ---
 # ClusterExtension for OLMv1 operator installation (OwnNamespace mode)
+# NOTE: watchNamespace requires TechPreviewNoUpgrade feature set with SingleOwnNamespaceInstallSupport
+# For OCP 4.18-4.20 or clusters without this feature, remove the config section for AllNamespaces mode
 apiVersion: olm.operatorframework.io/v1
 kind: ClusterExtension
 metadata:

@@ -46,7 +46,7 @@ Use this template to create your Jira issue for OCPSTRAT-2268 Phase 2 validation
 - [x] Manager deployment successful
 - [x] Kafka cluster deployed and Ready
 - [x] PostgreSQL cluster deployed and Ready
-- [x] Grafana deployment successful
+- [ ] Grafana deployment successful (not validated by automated script)
 - [x] Overall system status: Running
 
 **Functional Tests Run:**

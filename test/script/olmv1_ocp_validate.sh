@@ -11,11 +11,17 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-VALIDATION_FAILED=0
+INSTALLATION_FAILED=0
+RUNTIME_FAILED=0
 
-fail_validation() {
-  echo -e "${RED}VALIDATION FAILED: $1${NC}"
-  VALIDATION_FAILED=1
+fail_installation() {
+  echo -e "${RED}INSTALLATION VALIDATION FAILED: $1${NC}"
+  INSTALLATION_FAILED=1
+}
+
+fail_runtime() {
+  echo -e "${RED}RUNTIME VALIDATION FAILED: $1${NC}"
+  RUNTIME_FAILED=1
 }
 
 echo -e "${YELLOW}=== OLMv1 Production Validation ===${NC}"
@@ -40,7 +46,7 @@ if oc get deploy -n openshift-catalogd &>/dev/null && \
    oc get deploy -n openshift-operator-controller &>/dev/null; then
   echo -e "${GREEN}  ✓ OLMv1 system components present${NC}"
 else
-  fail_validation "OLMv1 system components missing"
+  fail_installation "OLMv1 system components missing"
 fi
 
 # 2. Verify ClusterCatalog
@@ -50,7 +56,7 @@ CATALOG_STATUS=$(oc get clustercatalog/global-hub \
 if [[ "$CATALOG_STATUS" == "True" ]]; then
   echo -e "${GREEN}  ✓ ClusterCatalog is Serving${NC}"
 else
-  fail_validation "ClusterCatalog not Serving"
+  fail_installation "ClusterCatalog not Serving"
 fi
 
 # 3. Verify ServiceAccount exists
@@ -58,7 +64,7 @@ echo -e "${YELLOW}[3/10] Checking ServiceAccount...${NC}"
 if oc get sa/multicluster-global-hub-operator-rh-installer -n "$GH_NAMESPACE" &>/dev/null; then
   echo -e "${GREEN}  ✓ ServiceAccount exists${NC}"
 else
-  fail_validation "ServiceAccount not found"
+  fail_installation "ServiceAccount not found"
 fi
 
 # 4. Verify ClusterRoleBinding exists
@@ -66,7 +72,7 @@ echo -e "${YELLOW}[4/10] Checking ClusterRoleBinding...${NC}"
 if oc get clusterrolebinding/multicluster-global-hub-operator-rh-installer-binding &>/dev/null; then
   echo -e "${GREEN}  ✓ ClusterRoleBinding exists${NC}"
 else
-  fail_validation "ClusterRoleBinding not found"
+  fail_installation "ClusterRoleBinding not found"
 fi
 
 # 5. Verify ClusterExtension installed successfully
@@ -81,7 +87,7 @@ if [[ "$CE_STATUS" == "True" ]]; then
     -o jsonpath='{.status.install.bundle.version}' 2>/dev/null || echo "unknown")
   echo "    Installed version: $INSTALLED_VERSION"
 else
-  fail_validation "ClusterExtension not Installed"
+  fail_installation "ClusterExtension not Installed"
   echo "    Status conditions:"
   oc get clusterextension/multicluster-global-hub-operator-rh -o jsonpath='{.status.conditions}' | jq '.'
 fi
@@ -96,11 +102,11 @@ if oc wait deploy/multicluster-global-hub-operator -n "$GH_NAMESPACE" \
     -o jsonpath='{.status.availableReplicas}')
   echo "    Available replicas: $REPLICAS"
 else
-  fail_validation "Operator deployment not Available"
+  fail_installation "Operator deployment not Available"
 fi
 
 echo ""
-echo -e "${GREEN}=== Installation Validation: $([ $VALIDATION_FAILED -eq 0 ] && echo PASS || echo FAIL) ===${NC}"
+echo -e "${GREEN}=== Installation Validation: $([ $INSTALLATION_FAILED -eq 0 ] && echo PASS || echo FAIL) ===${NC}"
 echo ""
 
 # ── Phase 2 Requirement: Runtime Validation (Step 4) ────────────────────────
@@ -110,8 +116,10 @@ echo ""
 
 # Check if MCGH CR exists
 if ! oc get mcgh -n "$GH_NAMESPACE" &>/dev/null; then
-  echo -e "${YELLOW}No MulticlusterGlobalHub CR found.${NC}"
-  echo "To complete runtime validation, create a MulticlusterGlobalHub CR:"
+  echo -e "${RED}ERROR: No MulticlusterGlobalHub CR found.${NC}"
+  echo "Runtime validation requires a MulticlusterGlobalHub instance."
+  echo ""
+  echo "To deploy one, run:"
   echo ""
   echo "  oc apply -f - <<EOF"
   echo "  apiVersion: operator.open-cluster-management.io/v1alpha4"
@@ -129,8 +137,20 @@ if ! oc get mcgh -n "$GH_NAMESPACE" &>/dev/null; then
   echo "        storageSize: 10Gi"
   echo "  EOF"
   echo ""
-  echo "Then re-run this script to validate runtime behavior."
-  exit 0
+  echo "Then re-run this script."
+  fail_runtime "MulticlusterGlobalHub CR not found"
+  RUNTIME_FAILED=1
+  echo ""
+  echo "**Installation Result (Step 3):**"
+  if [[ $INSTALLATION_FAILED -eq 0 ]]; then
+    echo "- Status: ✅ PASS"
+  else
+    echo "- Status: ❌ FAIL"
+  fi
+  echo ""
+  echo "**Runtime Result (Step 4):**"
+  echo "- Status: ❌ FAIL - MulticlusterGlobalHub CR required but not found"
+  exit 1
 fi
 
 # 7. Validate manager deployment
@@ -139,7 +159,7 @@ if oc wait deploy/multicluster-global-hub-manager -n "$GH_NAMESPACE" \
      --for=condition=Available=True --timeout=300s &>/dev/null; then
   echo -e "${GREEN}  ✓ Manager deployment is Available${NC}"
 else
-  fail_validation "Manager deployment not Available"
+  fail_runtime "Manager deployment not Available"
 fi
 
 # 8. Validate Kafka
@@ -148,40 +168,59 @@ if oc wait kafka -n "$GH_NAMESPACE" --all \
      --for=condition=Ready=True --timeout=300s &>/dev/null; then
   echo -e "${GREEN}  ✓ Kafka cluster is Ready${NC}"
 else
-  fail_validation "Kafka cluster not Ready"
+  fail_runtime "Kafka cluster not Ready"
 fi
 
 # 9. Validate PostgreSQL
 echo -e "${YELLOW}[9/10] Checking PostgreSQL cluster...${NC}"
+# Determine expected replica count from availabilityConfig
+AVAILABILITY_CONFIG=$(oc get mcgh -n "$GH_NAMESPACE" -o jsonpath='{.items[0].spec.availabilityConfig}' 2>/dev/null || echo "Basic")
+if [[ "$AVAILABILITY_CONFIG" == "High" ]]; then
+  EXPECTED_REPLICAS=3
+else
+  EXPECTED_REPLICAS=1
+fi
+
 if oc wait statefulset -n "$GH_NAMESPACE" \
      -l postgres-operator.crunchydata.com/cluster \
-     --for=jsonpath='{.status.readyReplicas}'=3 --timeout=300s &>/dev/null; then
-  echo -e "${GREEN}  ✓ PostgreSQL cluster is Ready (3 replicas)${NC}"
+     --for=jsonpath="{.status.readyReplicas}"=$EXPECTED_REPLICAS --timeout=300s &>/dev/null; then
+  echo -e "${GREEN}  ✓ PostgreSQL cluster is Ready ($EXPECTED_REPLICAS replicas)${NC}"
 else
-  # Try single replica
-  if oc wait statefulset -n "$GH_NAMESPACE" \
-       -l postgres-operator.crunchydata.com/cluster \
-       --for=jsonpath='{.status.readyReplicas}'=1 --timeout=60s &>/dev/null; then
-    echo -e "${GREEN}  ✓ PostgreSQL cluster is Ready (1 replica)${NC}"
-  else
-    fail_validation "PostgreSQL cluster not Ready"
-  fi
+  fail_runtime "PostgreSQL cluster not Ready (expected $EXPECTED_REPLICAS replicas)"
 fi
 
 # 10. Validate overall MCGH status
 echo -e "${YELLOW}[10/10] Checking MulticlusterGlobalHub status...${NC}"
-MCGH_PHASE=$(oc get mcgh -n "$GH_NAMESPACE" \
-  -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "unknown")
-if [[ "$MCGH_PHASE" == "Running" ]]; then
-  echo -e "${GREEN}  ✓ MulticlusterGlobalHub phase: Running${NC}"
-elif [[ "$MCGH_PHASE" == "Progressing" ]]; then
-  echo -e "${YELLOW}  ⚠ MulticlusterGlobalHub phase: Progressing (still starting)${NC}"
-else
-  fail_validation "MulticlusterGlobalHub phase: $MCGH_PHASE (expected Running)"
+
+# Wait for Running status with timeout
+TIMEOUT=300
+ELAPSED=0
+MCGH_PHASE=""
+
+while [[ $ELAPSED -lt $TIMEOUT ]]; do
+  MCGH_PHASE=$(oc get mcgh -n "$GH_NAMESPACE" \
+    -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "unknown")
+
+  if [[ "$MCGH_PHASE" == "Running" ]]; then
+    echo -e "${GREEN}  ✓ MulticlusterGlobalHub phase: Running${NC}"
+    break
+  elif [[ "$MCGH_PHASE" == "Progressing" ]] || [[ "$MCGH_PHASE" == "" ]]; then
+    sleep 10
+    ELAPSED=$((ELAPSED + 10))
+  else
+    # Unexpected phase
+    fail_runtime "MulticlusterGlobalHub phase: $MCGH_PHASE (expected Running)"
+    break
+  fi
+done
+
+# If we timed out waiting for Running
+if [[ $ELAPSED -ge $TIMEOUT ]] && [[ "$MCGH_PHASE" != "Running" ]]; then
+  fail_runtime "MulticlusterGlobalHub did not reach Running state within ${TIMEOUT}s (current: $MCGH_PHASE)"
 fi
 
 echo ""
-echo -e "${GREEN}=== Runtime Validation: $([ $VALIDATION_FAILED -eq 0 ] && echo PASS || echo FAIL) ===${NC}"
+echo -e "${GREEN}=== Runtime Validation: $([ $RUNTIME_FAILED -eq 0 ] && echo PASS || echo FAIL) ===${NC}"
 echo ""
 
 # ── Validation Summary for Jira Issue ───────────────────────────────────────
@@ -195,7 +234,7 @@ echo "- Feature Set: $FEATURE_SET"
 echo "- Operator Namespace: $GH_NAMESPACE"
 echo ""
 echo "**Installation Result (Step 3):**"
-if [[ $VALIDATION_FAILED -eq 0 ]]; then
+if [[ $INSTALLATION_FAILED -eq 0 ]]; then
   echo "- Status: ✅ PASS"
   echo "- ClusterExtension installed successfully"
   echo "- Version: $INSTALLED_VERSION"
@@ -205,7 +244,7 @@ else
 fi
 echo ""
 echo "**Runtime Result (Step 4):**"
-if [[ $VALIDATION_FAILED -eq 0 ]]; then
+if [[ $RUNTIME_FAILED -eq 0 ]]; then
   echo "- Status: ✅ PASS"
   echo "- All components deployed and healthy"
   echo "- Manager, Kafka, PostgreSQL operational"
@@ -225,7 +264,7 @@ echo "(Describe any issues, warnings, or observations)"
 echo ""
 
 # Exit with failure if any validations failed
-if [[ $VALIDATION_FAILED -ne 0 ]]; then
+if [[ $INSTALLATION_FAILED -ne 0 ]] || [[ $RUNTIME_FAILED -ne 0 ]]; then
   echo -e "${RED}One or more validations failed. See details above.${NC}"
   exit 1
 fi

@@ -59,6 +59,8 @@ echo -e "${GREEN}OLMv1 components verified${NC}"
 
 # ── Check for TechPreviewNoUpgrade feature set (OCP 4.21+) ──────────────────
 FEATURE_SET=$(oc get featuregate cluster -o jsonpath='{.spec.featureSet}' 2>/dev/null || echo "unknown")
+OWNNAMESPACE_SUPPORTED=false
+
 if [[ "$FEATURE_SET" == "TechPreviewNoUpgrade" ]]; then
   echo -e "${GREEN}TechPreviewNoUpgrade feature set enabled${NC}"
 
@@ -68,16 +70,18 @@ if [[ "$FEATURE_SET" == "TechPreviewNoUpgrade" ]]; then
        -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null | \
        grep -q "SingleOwnNamespaceInstallSupport=true"; then
     echo -e "${GREEN}SingleOwnNamespaceInstallSupport: Enabled${NC}"
+    OWNNAMESPACE_SUPPORTED=true
   else
     echo -e "${YELLOW}WARNING: SingleOwnNamespaceInstallSupport not enabled${NC}"
-    echo "The operator requires OwnNamespace install mode support."
-    echo "Attempting to proceed anyway..."
+    echo "OwnNamespace mode requires this feature. Will use AllNamespaces mode."
   fi
 elif [[ "$OCP_VERSION" == "unknown" ]]; then
   echo -e "${YELLOW}WARNING: Could not determine feature set${NC}"
+  echo "Will attempt AllNamespaces mode."
 else
   echo -e "${YELLOW}Feature set: ${FEATURE_SET}${NC}"
-  echo "Note: TechPreviewNoUpgrade is recommended for OLMv1 testing on OCP 4.21+"
+  echo "Note: OwnNamespace mode is a Technology Preview feature requiring TechPreviewNoUpgrade"
+  echo "Will use AllNamespaces mode for this cluster."
 fi
 
 # ── Step 1: Apply ImageDigestMirrorSet ──────────────────────────────────────
@@ -172,7 +176,10 @@ echo -e "${GREEN}ServiceAccount and RBAC created${NC}"
 
 # ── Step 5: Install operator via ClusterExtension ───────────────────────────
 echo -e "${YELLOW}=== Step 5: Installing operator via ClusterExtension ===${NC}"
-oc apply -f - <<EOF
+
+if [[ "$OWNNAMESPACE_SUPPORTED" == "true" ]]; then
+  echo "Installing with OwnNamespace mode (watchNamespace: ${GH_NAMESPACE})"
+  oc apply -f - <<EOF
 apiVersion: olm.operatorframework.io/v1
 kind: ClusterExtension
 metadata:
@@ -193,6 +200,26 @@ spec:
         matchLabels:
           olm.operatorframework.io/metadata.name: global-hub
 EOF
+else
+  echo "Installing with AllNamespaces mode (no watchNamespace)"
+  oc apply -f - <<EOF
+apiVersion: olm.operatorframework.io/v1
+kind: ClusterExtension
+metadata:
+  name: multicluster-global-hub-operator-rh
+spec:
+  namespace: ${GH_NAMESPACE}
+  serviceAccount:
+    name: multicluster-global-hub-operator-rh-installer
+  source:
+    sourceType: Catalog
+    catalog:
+      packageName: multicluster-global-hub-operator-rh
+      selector:
+        matchLabels:
+          olm.operatorframework.io/metadata.name: global-hub
+EOF
+fi
 
 echo -e "${YELLOW}Waiting for ClusterExtension installation...${NC}"
 sleep 10  # Give it a moment to start
