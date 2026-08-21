@@ -64,16 +64,25 @@ OWNNAMESPACE_SUPPORTED=false
 if [[ "$FEATURE_SET" == "TechPreviewNoUpgrade" ]]; then
   echo -e "${GREEN}TechPreviewNoUpgrade feature set enabled${NC}"
 
-  # Verify SingleOwnNamespaceInstallSupport is enabled
-  echo -e "${YELLOW}--- Checking SingleOwnNamespaceInstallSupport feature ---${NC}"
-  if oc get deploy operator-controller-controller-manager -n openshift-operator-controller \
-       -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null | \
-       grep -q "SingleOwnNamespaceInstallSupport=true"; then
-    echo -e "${GREEN}SingleOwnNamespaceInstallSupport: Enabled${NC}"
+  # Verify OwnNamespace feature gate is enabled
+  # OCP 4.22+ uses "NewOLMOwnSingleNamespace", earlier versions use "SingleOwnNamespaceInstallSupport"
+  echo -e "${YELLOW}--- Checking OwnNamespace install mode support ---${NC}"
+
+  OPERATOR_ARGS=$(oc get deploy operator-controller-controller-manager -n openshift-operator-controller \
+    -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo "")
+
+  if echo "$OPERATOR_ARGS" | grep -q "NewOLMOwnSingleNamespace=true"; then
+    echo -e "${GREEN}NewOLMOwnSingleNamespace: Enabled (OCP 4.22+)${NC}"
+    OWNNAMESPACE_SUPPORTED=true
+  elif echo "$OPERATOR_ARGS" | grep -q "SingleOwnNamespaceInstallSupport=true"; then
+    echo -e "${GREEN}SingleOwnNamespaceInstallSupport: Enabled (OCP 4.21)${NC}"
     OWNNAMESPACE_SUPPORTED=true
   else
-    echo -e "${YELLOW}WARNING: SingleOwnNamespaceInstallSupport not enabled${NC}"
-    echo "OwnNamespace mode requires this feature. Will use AllNamespaces mode."
+    echo -e "${YELLOW}WARNING: OwnNamespace feature gate not detected${NC}"
+    echo "OwnNamespace mode requires one of:"
+    echo "  - NewOLMOwnSingleNamespace=true (OCP 4.22+)"
+    echo "  - SingleOwnNamespaceInstallSupport=true (OCP 4.21)"
+    echo "Will use AllNamespaces mode."
   fi
 elif [[ "$OCP_VERSION" == "unknown" ]]; then
   echo -e "${YELLOW}WARNING: Could not determine feature set${NC}"
