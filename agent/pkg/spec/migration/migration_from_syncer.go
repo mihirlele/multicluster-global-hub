@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,8 +32,10 @@ import (
 	"k8s.io/client-go/util/retry"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	clusterv1beta1 "open-cluster-management.io/api/cluster/v1beta1"
+	workv1 "open-cluster-management.io/api/work/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"bytes"
 
 	"github.com/stolostron/multicluster-global-hub/agent/pkg/configs"
 	migrationv1alpha1 "github.com/stolostron/multicluster-global-hub/operator/api/migration/v1alpha1"
@@ -666,12 +669,173 @@ spec:
 	return obj, err
 }
 
+func ensureMigrationManifestWork(ctx context.Context, c client.Client, clusterName string, bootstrapSecret *corev1.Secret, targetHub string, leafHubName string) error {
+	// Get MCH version to determine if MultipleHubs is supported
+	mch, err := utils.ListMCH(ctx, c)
+	if err != nil {
+		return err
+	}
+	if mch == nil {
+		return fmt.Errorf("no MCH found")
+	}
+	if strings.Contains(mch.Status.CurrentVersion, "2.13") {
+		return fmt.Errorf("MultipleHubs feature not supported in MCH version 2.13")
+	}
+
+	// Get the ManifestWork for the cluster
+	work := &workv1.ManifestWork{}
+	workKey := client.ObjectKey{Namespace: clusterName, Name: clusterName + "-klusterlet"}
+	if err := c.Get(ctx, workKey, work); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("ManifestWork %s/%s not found", clusterName, clusterName+"-klusterlet")
+		}
+		return err
+	}
+
+	// Convert the typed ManifestWork to unstructured for easy manipulation
+	workMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(work)
+	if err != nil {
+		return fmt.Errorf("failed to convert ManifestWork to unstructured: %w", err)
+	}
+	workUnstructured := &unstructured.Unstructured{Object: workMap}
+
+	// Desired Secret manifest
+	desiredSecret := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "Secret",
+			"metadata": map[string]interface{}{
+				"name":      "bootstrap-" + targetHub,
+				"namespace": "open-cluster-management-agent",
+			},
+			"data": map[string]interface{}{
+				"kubeconfig": bootstrapSecret.Data["kubeconfig"],
+			},
+		},
+	}
+
+	// Find existing KlusterletConfig and Secret in the work
+	manifests, found, err := unstructured.NestedSlice(workUnstructured.Object, "spec", "workload", "manifests")
+	if err != nil || !found {
+		return fmt.Errorf("failed to get manifests from ManifestWork: %w", err)
+	}
+	secretFound := false
+	klusterletConfigFound := false
+	newManifests := []interface{}{}
+
+	for _, manifest := range manifests {
+		manifestMap := manifest.(map[string]interface{})
+		manifestUnstructured := &unstructured.Unstructured{Object: manifestMap}
+		gvk := manifestUnstructured.GroupVersionKind()
+		if gvk.Kind == "Secret" && gvk.Group == "" && gvk.Version == "v1" {
+			name, _, _ := unstructured.NestedString(manifestUnstructured.Object, "metadata", "name")
+			namespace, _, _ := unstructured.NestedString(manifestUnstructured.Object, "metadata", "namespace")
+			if name == "bootstrap-"+targetHub && namespace == "open-cluster-management-agent" {
+				secretFound = true
+				// Skip this manifest; we will add our own desiredSecret
+				continue
+			}
+		}
+		if gvk.Kind == "KlusterletConfig" && gvk.Group == "config.open-cluster-management.io" && gvk.Version == "v1alpha1" {
+			klusterletConfigFound = true
+			// We will update this manifest
+			updatedManifest := manifestUnstructured.DeepCopy()
+			// Remove old bootstrapKubeConfigs if present
+			unstructured.RemoveNestedField(updatedManifest.Object, "spec", "bootstrapKubeConfigs")
+			// Set MultipleHubs config
+			err := unstructured.SetNestedField(updatedManifest.Object, "IncludeCurrentHub", "spec", "multipleHubsConfig", "genBootstrapKubeConfigStrategy")
+			if err != nil {
+				return fmt.Errorf("failed to set genBootstrapKubeConfigStrategy: %w", err)
+			}
+			bootstrapKubeConfigs := map[string]interface{}{
+				"type": "LocalSecrets",
+				"localSecretsConfig": map[string]interface{}{
+					"kubeConfigSecrets": []map[string]string{
+						{
+							"name":      "bootstrap-" + targetHub,
+							"namespace": "open-cluster-management-agent",
+						},
+						{
+							"name":      "bootstrap-" + leafHubName,
+							"namespace": "open-cluster-management-agent",
+						},
+					},
+				},
+			}
+			err = unstructured.SetNestedMap(updatedManifest.Object, bootstrapKubeConfigs, "spec", "multipleHubsConfig", "bootstrapKubeConfigs")
+			if err != nil {
+				return fmt.Errorf("failed to set bootstrapKubeConfigs: %w", err)
+			}
+			newManifests = append(newManifests, updatedManifest.Object)
+			continue
+		}
+		// Keep other manifests
+		newManifests = append(newManifests, manifestUnstructured.Object)
+	}
+
+	// If we didn't find the KlusterletConfig, something is wrong
+	if !klusterletConfigFound {
+		return fmt.Errorf("KlusterletConfig not found in ManifestWork %s/%s", clusterName, clusterName+"-klusterlet")
+	}
+
+	// Add the desired Secret if not found
+	if !secretFound {
+		newManifests = append(newManifests, desiredSecret.Object)
+	}
+
+	// Set the updated manifests back into the unstructured object
+	err = unstructured.SetNestedSlice(workUnstructured.Object, newManifests, "spec", "workload", "manifests")
+	if err != nil {
+		return fmt.Errorf("failed to set manifests in ManifestWork: %w", err)
+	}
+
+	// Convert back to typed ManifestWork
+	updatedWork := &workv1.ManifestWork{}
+	err = runtime.DefaultUnstructuredConverter.FromUnstructured(workUnstructured.Object, updatedWork)
+	if err != nil {
+		return fmt.Errorf("failed to convert unstructured to ManifestWork: %w", err)
+	}
+
+	// Check if we need to update the work
+	oldWorkBytes, err := json.Marshal(work)
+	if err != nil {
+		return fmt.Errorf("failed to marshal old ManifestWork: %w", err)
+	}
+	newWorkBytes, err := json.Marshal(updatedWork)
+	if err != nil {
+		return fmt.Errorf("failed to marshal new ManifestWork: %w", err)
+	}
+	if bytes.Equal(oldWorkBytes, newWorkBytes) {
+		// No changes needed
+		return nil
+	}
+
+	// Update the work
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Get the latest version of the work to avoid conflicts
+		latestWork := &workv1.ManifestWork{}
+		if err := c.Get(ctx, workKey, latestWork); err != nil {
+			return err
+		}
+		// Copy the updated specs to the latest work
+		latestWork.Spec.Workload = updatedWork.Spec.Workload
+		return c.Update(ctx, latestWork)
+	})
+}
+
+
 func (m *MigrationSourceSyncer) registering(
 	ctx context.Context, migratingEvt *migration.MigrationSourceBundle,
 ) error {
 	managedClusters := migratingEvt.ManagedClusters
-	// set the hub accept client into false to trigger the re-registering
 	for _, managedCluster := range managedClusters {
+		// First, update the ManifestWork in the leaf hub (managed cluster) to configure MultipleHubs
+		// and add the bootstrap secret for the target hub.
+		if err := ensureMigrationManifestWork(ctx, m.client, managedCluster, migratingEvt.BootstrapSecret, migratingEvt.ToHub, m.leafHubName); err != nil {
+			return fmt.Errorf("failed to ensure migration ManifestWork for managed cluster %s: %w", managedCluster, err)
+		}
+
+		// Then, set HubAcceptsClient to false to trigger the re-registering
 		log.Debugf("updating managed cluster %s to set HubAcceptsClient as false", managedCluster)
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			mc := &clusterv1.ManagedCluster{}
